@@ -1,10 +1,13 @@
 package config
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +15,55 @@ import (
 
 	"github.com/prometheus/common/config"
 )
+
+// ----
+
+type CustConfig struct {
+	Customers map[string]interface{} `yaml:"customers"`
+	Monitors  []Monitor              `yaml:"monitors"`
+}
+
+type Customer struct {
+}
+
+type Monitor struct {
+	Service   string              `yaml:"service,omitempty"`
+	Hosts     []string            `yaml:"hosts,omitempty"`
+	Port      string              `yaml:"port,omitempty"`
+	CheckUser string              `yaml:"check_user,omitempty"`
+	Timeout   time.Duration       `yaml:"timeout,omitempty"`
+	Auth      []map[string]string `yaml:"auth"`
+}
+
+// type AuthStruct  {
+// 	User string `yaml:"user,omitempty"`
+// 	Pass string `yaml:"pass,omitempty"`
+// }
+
+type SafeCustConfig struct {
+	sync.RWMutex
+	C *CustConfig
+}
+
+func (sc *SafeCustConfig) ReloadConfig(confFile string) (err error) {
+	var c = &CustConfig{}
+	ymalFile, err := ioutil.ReadFile(confFile)
+	if err != nil {
+		return fmt.Errorf("Error reading config file: %s", err)
+	}
+
+	if err := yaml.UnmarshalStrict(ymalFile, c); err != nil {
+		return fmt.Errorf("Error parsing config file: %s", err)
+	}
+
+	sc.Lock()
+	sc.C = c
+	sc.Unlock()
+
+	return nil
+}
+
+// ----
 
 type Config struct {
 	Modules map[string]Module `yaml:"modules"`
@@ -73,11 +125,11 @@ type QueryResponse struct {
 }
 
 type TCPProbe struct {
-	PreferredIPProtocol string           `yaml:"preferred_ip_protocol,omitempty"`
-	SourceIPAddress     string           `yaml:"source_ip_address,omitempty"`
-	QueryResponse       []QueryResponse  `yaml:"query_response,omitempty"`
-	TLS                 bool             `yaml:"tls,omitempty"`
-	TLSConfig           config.TLSConfig `yaml:"tls_config,omitempty"`
+	PreferredIPProtocol string          `yaml:"preferred_ip_protocol,omitempty"`
+	SourceIPAddress     string          `yaml:"source_ip_address,omitempty"`
+	QueryResponse       []QueryResponse `yaml:"query_response,omitempty"`
+	TLS                 bool            `yaml:"tls,omitempty"`
+	TLSConfig           TLSConfig       `yaml:"tls_config,omitempty"`
 }
 
 type ICMPProbe struct {
@@ -102,6 +154,81 @@ type DNSProbe struct {
 type DNSRRValidator struct {
 	FailIfMatchesRegexp    []string `yaml:"fail_if_matches_regexp,omitempty"`
 	FailIfNotMatchesRegexp []string `yaml:"fail_if_not_matches_regexp,omitempty"`
+}
+
+// NewTLSConfig creates a new tls.Config from the given config.TLSConfig.
+func NewTLSConfig(cfg *TLSConfig) (*tls.Config, error) {
+	tlsConfig := &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify}
+
+	// If a CA cert is provided then let's read it in so we can validate the
+	// scrape target's certificate properly.
+	if len(cfg.CAFile) > 0 {
+		caCertPool := x509.NewCertPool()
+		// Load CA cert.
+		caCert, err := ioutil.ReadFile(cfg.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("unable to use specified CA cert %s: %s", cfg.CAFile, err)
+		}
+		caCertPool.AppendCertsFromPEM(caCert)
+		tlsConfig.RootCAs = caCertPool
+	}
+
+	if len(cfg.ServerName) > 0 {
+		tlsConfig.ServerName = cfg.ServerName
+	}
+
+	// If a client cert & key is provided then configure TLS config accordingly.
+	if len(cfg.CertFile) > 0 && len(cfg.KeyFile) == 0 {
+		return nil, fmt.Errorf("client cert file %q specified without client key file", cfg.CertFile)
+	} else if len(cfg.KeyFile) > 0 && len(cfg.CertFile) == 0 {
+		return nil, fmt.Errorf("client key file %q specified without client cert file", cfg.KeyFile)
+	} else if len(cfg.CertFile) > 0 && len(cfg.KeyFile) > 0 {
+		cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("unable to use specified client cert (%s) & key (%s): %s", cfg.CertFile, cfg.KeyFile, err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+	}
+	tlsConfig.BuildNameToCertificate()
+
+	return tlsConfig, nil
+}
+
+// TLSConfig configures the options for TLS connections.
+type TLSConfig struct {
+	// The CA cert to use for the targets.
+	CAFile string `yaml:"ca_file,omitempty"`
+	// The client cert file for the targets.
+	CertFile string `yaml:"cert_file,omitempty"`
+	// The client key file for the targets.
+	KeyFile string `yaml:"key_file,omitempty"`
+	// Used to verify the hostname for the targets.
+	ServerName string `yaml:"server_name,omitempty"`
+	// Disable target certificate validation.
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
+
+	// Catches all undefined fields and must be empty after parsing.
+	XXX map[string]interface{} `yaml:",inline"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (c *TLSConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type plain TLSConfig
+	if err := unmarshal((*plain)(c)); err != nil {
+		return err
+	}
+	return checkOverflow(c.XXX, "TLS config")
+}
+
+func checkOverflow(m map[string]interface{}, ctx string) error {
+	if len(m) > 0 {
+		var keys []string
+		for k := range m {
+			keys = append(keys, k)
+		}
+		return fmt.Errorf("unknown fields in %s: %s", ctx, strings.Join(keys, ", "))
+	}
+	return nil
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
